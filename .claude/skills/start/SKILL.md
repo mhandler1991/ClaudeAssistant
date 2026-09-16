@@ -17,7 +17,7 @@ allowed-tools: Bash(gh issue view:*), Bash(gh issue create:*), Bash(git log:*), 
 - Latest on dev: !`git log --oneline -5 origin/dev`
 - Working tree: !`git status --short`
 - Current branch: !`git branch --show-current`
-- Does the feature branch already exist: !`git branch --list feature/$0-*`
+- Does the feature branch already exist: !`git branch --list "feature/$0-*"`
 
 (Five separate single-command injections — no `&&` or `|` anywhere in this file.)
 
