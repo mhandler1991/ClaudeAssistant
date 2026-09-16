@@ -17,7 +17,7 @@ allowed-tools: Bash(gh issue view:*), Bash(gh issue create:*), Bash(git log:*), 
 - Latest on dev: !`git log --oneline -5 origin/dev`
 - Working tree: !`git status --short`
 - Current branch: !`git branch --show-current`
-- Does the feature branch already exist: !`git branch --list "feature/$0-*"`
+- Local branches (look for one starting with `feature/$0-`): !`git branch --list`
 
 (Five separate single-command injections — no `&&` or `|` anywhere in this file.)
 
@@ -54,8 +54,8 @@ to flag.)
 4. Look up current docs (Context7) for any Apple or Swift Testing API this touches
    that you're not certain about.
 5. **Branch off `dev`, named for the first issue with a short kebab-case slug from its
-   title — or resume if that branch already exists.** If "Does the feature branch
-   already exist" above returned a match:
+   title — or resume if that branch already exists.** If "Local branches" above
+   lists one starting with `feature/$0-`, resume it:
    ```bash
    git checkout feature/$0-<slug>
    ```
