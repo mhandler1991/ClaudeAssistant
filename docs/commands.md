@@ -93,7 +93,7 @@ including bundled ones, run `/skills`.
 |---|---|
 | Merging any PR | You review, you merge |
 | Tagging a release | The rollback handle — deliberately not automated |
-| Running the loop against a real `Rogue-Arcade` issue | Needs a live `claude` session and real GitHub state; the success bar is about real PRs |
+| Running the loop against a real issue on this repo | Needs a live `claude` session and real GitHub state; the success bar is about real PRs |
 | Menu-bar smoke test | No automated hook into the status item until Phase 2 |
 | Putting the API key in Keychain | Once, by hand — the app reads it, never writes it |
 

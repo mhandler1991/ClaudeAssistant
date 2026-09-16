@@ -22,7 +22,7 @@ allowed-tools: Bash(gh issue create:*), Bash(gh issue list:*), Bash(gh api --met
    fit one, say so rather than forcing it — that's a signal about the roadmap, not
    just this issue.
 3. **Assign the owner label**: `owner:claude` if Claude implements it, `owner:you` if
-   it's a setting, a real-run test against `Rogue-Arcade`, or a judgement call.
+   it's a setting, a real-run test of the loop, or a judgement call.
 4. **Create it:**
    ```bash
    gh issue create --title "<title>" --milestone "<milestone>" --label "<owner label>" --body "<body in the template shape>"

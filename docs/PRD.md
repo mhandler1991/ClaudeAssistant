@@ -45,9 +45,10 @@ layer can *act* on; the fusion thesis is what it's architected toward.
 
 Two frictions, one immediate and one structural:
 
-- **Immediate:** small, well-specified tickets on the FPS Roguelike repo
-  (`Rogue-Arcade`) still cost a manual ritual — branch, worktree, write the prompt,
-  babysit the session, run tests, open the PR. Existing Claude Code monitors (CC
+- **Immediate:** small, well-specified tickets — starting with this repo's own — still
+  cost a manual ritual: branch, worktree, write the prompt, babysit the session, run
+  tests, open the PR. The app builds itself first; the configured repo can point
+  elsewhere once the loop is trusted. Existing Claude Code monitors (CC
   Monitor, Claude Status Bar, Claude Statistics) can *show* a session but can't
   *start* one or carry it through to a PR.
 - **Structural:** general activity coaches see the shape of a day but not the
@@ -156,7 +157,7 @@ redesign, not a setting.
 ## 5. Success
 
 **The bar:** three consecutive ticket-to-PR runs, driven entirely through the
-menu-bar UI against three different real `Rogue-Arcade` issues, where at least two of
+menu-bar UI against three different real `ClaudeAssistant` issues, where at least two of
 the three resulting PRs are mergeable with only minor edits.
 
 Secondary signals:

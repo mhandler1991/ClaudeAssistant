@@ -22,7 +22,7 @@ Legend: ⚡ Claude/app does this · 👤 you do this · 🚫 never · 📌 in sc
 └─────────────────────────────────────────────────────────────────────────────┘
         │ gh (user's own auth)                      │ git, tests only
         ▼                                           ▼
-   GitHub: issues, labels, draft PRs          target repo worktree (Rogue-Arcade)
+   GitHub: issues, labels, draft PRs          ticket worktree of the configured repo (this one)
 ```
 
 Three parties, and the boundaries between them are the whole design:
@@ -31,7 +31,7 @@ Three parties, and the boundaries between them are the whole design:
 |---|---|---|
 | **The app process** | Trusted | State machine, confirm gates, audit log, all `gh` calls that write to GitHub |
 | **The spawned `claude -p` session** | Untrusted | Only the worktree it was started in; runs the target repo's tests |
-| **The target repo (`Rogue-Arcade`)** | Trusted content, untrusted *issue text* | Its own `CLAUDE.md` conventions and test command |
+| **The target repo** — this one, `ClaudeAssistant`, per `PRD.md` §2 | Trusted content, untrusted *issue text* | Its `CLAUDE.md` conventions and test command. A ticket worktree is a checkout of this repo; the main checkout the app runs from is never the session's cwd |
 
 **Ruled out:**
 

@@ -15,9 +15,9 @@ independently testable and leaves the project in a usable state.
 A shell script, not the app: hardcoded issue number → worktree → headless Claude Code
 session with a stripped environment → target repo's test command → draft PR. Lives at
 `scripts/ticket-to-pr.sh` in this repo. Whatever it learns about `claude -p`,
-`stream-json`, timeouts, and the FPS Roguelike test loop is what Phase 1 builds on.
+`stream-json`, timeouts, and this repo's own test loop is what Phase 1 builds on.
 
-**Done when:** the script has run against three different real `Rogue-Arcade` issues
+**Done when:** the script has run against three different real `ClaudeAssistant` issues
 and at least two of the three resulting PRs were mergeable with only minor edits.
 
 **Milestone:** `Phase 0 - Mechanism`
@@ -31,7 +31,7 @@ runaway ceiling, test run on exit, confirm gate → push + draft PR, audit log w
 the app, notifications on Needs input / PR ready / Error. Running is a black box in
 this phase (elapsed time and worktree name only) — live signal is Phase 2.
 
-**Done when:** one full run from the menu bar, against a real `Rogue-Arcade` issue,
+**Done when:** one full run from the menu bar, against a real `ClaudeAssistant` issue,
 produces a draft PR with the push confirm gate hit exactly once and an audit-log entry
 written outside the worktree.
 
@@ -101,7 +101,7 @@ phase here.
 ## Current status
 
 **Active: Phase 0.** Nothing built yet. First job is `scripts/ticket-to-pr.sh` and
-three real runs against `Rogue-Arcade`.
+three real runs against this repo's own issues.
 
 ```bash
 gh issue list --milestone "Phase 0 - Mechanism"    # what this phase still owes
@@ -111,7 +111,7 @@ gh issue list --milestone "Phase 0 - Mechanism"    # what this phase still owes
 
 ## How to iterate
 
-Run the loop against real `Rogue-Arcade` issues, not synthetic ones — the success bar
+Run the loop against real `ClaudeAssistant` issues, not synthetic ones — the success bar
 is about real PRs, and synthetic issues hide the prompt-assembly and test-command
 problems that matter. After each run, read the audit-log entry and the transcript
 before touching code; the failure sub-reason is the thing to fix, not the UI state
