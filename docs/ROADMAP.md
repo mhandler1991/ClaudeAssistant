@@ -68,9 +68,9 @@ observed working or an issue with a repro.
 ### Phase 4 — Interpretation layer (dev signal only)
 
 Local LLM via Ollama (endpoint: `CLAUDE.md` §1) reads the hook/transcript stream and
-produces
-observations ("same test failed 4 times", "session has been in a fix-run-fail loop for
-12 minutes"). Surfaced in the popover as banners. No general-activity signal yet.
+produces observations ("same test failed 4 times", "session has been in a fix-run-fail
+loop for 12 minutes"). Surfaced in the popover as banners. No general-activity signal
+yet.
 
 **Done when:** the app surfaces at least one observation from a real session that
 Max didn't hand-prompt for and that names a pattern he recognizes as real.
