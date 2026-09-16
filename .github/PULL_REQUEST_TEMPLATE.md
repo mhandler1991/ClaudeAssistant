@@ -29,5 +29,5 @@ One line: what this release includes, or a pointer to the milestone.
 
 - [ ] Checks green on `dev`
 - [ ] Ran the app from `dev` against at least one real ticket
-- [ ] Tagged as `v0.{phase}.{patch}` after merge
+- [ ] Tagged after merge (format: `docs/workflow.md` §4)
 -->

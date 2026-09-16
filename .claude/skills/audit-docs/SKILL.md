@@ -31,7 +31,8 @@ flag anything else that's clearly broken.)
 7. **Skills without `disable-model-invocation`.** Any `.claude/skills/*/SKILL.md` with a
    side effect (branches, pushes, deletes, files an issue, opens a PR) not set to
    `disable-model-invocation: true`.
-8. **Un-probed argument indexing.** Any skill using `$0`/`$1`/`$ARGUMENTS` — confirm it
+8. **Un-probed argument indexing.** Any skill using `$0`/`$1`/the full-arguments
+   variable — confirm it
    matches this installation's actual behavior (`.claude/skills/probe-args/` exists
    until that's been done once; its continued existence is itself a finding).
 9. **A documented gate with no forced trigger.** A step described in `CLAUDE.md` or
