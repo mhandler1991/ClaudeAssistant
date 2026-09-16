@@ -2,7 +2,7 @@
 description: Turn a rough description into a properly formatted GitHub issue (milestone, owner label, acceptance criteria)
 argument-hint: [description of the work]
 disable-model-invocation: true
-allowed-tools: Bash(gh issue create:*), Bash(gh issue list:*), Bash(gh api repos/mhandler1991/ClaudeAssistant/milestones*)
+allowed-tools: Bash(gh issue create:*), Bash(gh issue list:*), Bash(gh api --method GET repos/mhandler1991/ClaudeAssistant/milestones:*)
 ---
 
 # New issue: $ARGUMENTS

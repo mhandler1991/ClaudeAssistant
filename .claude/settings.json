@@ -19,7 +19,7 @@
       "Bash(gh pr view:*)",
       "Bash(gh pr list:*)",
       "Bash(gh pr create:*)",
-      "Bash(gh api repos/mhandler1991/ClaudeAssistant/milestones*)",
+      "Bash(gh api --method GET repos/mhandler1991/ClaudeAssistant/milestones:*)",
       "Bash(swift build:*)",
       "Bash(swift format lint:*)",
       "Bash(swift test:*)",
