@@ -9,7 +9,7 @@ allowed-tools: Bash(gh issue create:*), Bash(gh issue list:*), Bash(gh api repos
 
 ## Context
 
-- Open milestones: !`gh api "repos/mhandler1991/ClaudeAssistant/milestones?state=open" --jq ".[].title"`
+- Open milestones (JSON — read the `title` fields): !`gh api --method GET repos/mhandler1991/ClaudeAssistant/milestones -f state=open`
 - `docs/ROADMAP.md`'s current phase — read the file directly.
 
 ## Sequence
