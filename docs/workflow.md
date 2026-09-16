@@ -39,7 +39,7 @@ deploy target — `/promote` + a tag is the whole release.
 |---|---|---|
 | `swift build` / `swift format lint` / `swift test` | ⚡ `/start` runs them locally before every PR | No CI workflow yet — there's nothing to build until `Package.swift` exists. Add a GitHub Actions workflow in the same PR that adds `Package.swift`; from then on it blocks merge |
 | `bash -n scripts/*.sh` | ⚡ `/start`, Phase 0 | The only automated check while Phase 0 is active |
-| The ticket-to-PR loop itself, against a real `Rogue-Arcade` issue | 👤 Manual | Needs a real `claude` session and real GitHub state; faking either tests nothing that matters (`ROADMAP.md` "How to iterate") |
+| The ticket-to-PR loop itself, against a real issue on this repo | 👤 Manual | Needs a real `claude` session and real GitHub state; faking either tests nothing that matters (`ROADMAP.md` "How to iterate") |
 | Menu-bar smoke test (launches, status item appears, Idle renders) | 👤 Manual | Until Phase 2's Diagnostics tab gives a test something to read |
 
 ---
@@ -113,8 +113,9 @@ line in `ROADMAP.md` names them. `ROADMAP.md` is the source;
 milestones follow it, never the reverse.
 
 **Labels:** `owner:claude` (Claude implements), `owner:you` (a setting, a real-run
-test, a judgement call), `blocked`, `audit-log`. The `ready` / `in-progress` labels
-belong to the *target* repo (`Rogue-Arcade`), not this one.
+test, a judgement call), `blocked`, `audit-log`. Plus the two the loop itself reads
+and writes, since this repo is its own target: `ready` (pick-up-able by the loop) and
+`in-progress` (claimed).
 
 **Branch naming:** `feature/{issue}-{slug}` — `feature/12-env-allowlist`. No issue:
 `feature/{slug}`.

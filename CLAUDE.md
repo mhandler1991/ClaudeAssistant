@@ -221,7 +221,7 @@ Test what fails silently, not everything:
 - **Ceiling** — a fake process that never exits is killed at the wall-clock limit.
 
 Anything that needs a real `claude` or `gh` — the full loop — is 👤 manual, against
-real `Rogue-Arcade` issues, per `docs/ROADMAP.md` "How to iterate". Don't fake `gh`
+real `ClaudeAssistant` issues, per `docs/ROADMAP.md` "How to iterate". Don't fake `gh`
 output in a test that claims to test the loop.
 
 **Smoke test:** the app launches, the status item appears, and Idle renders. Manual
@@ -273,9 +273,9 @@ covers it (why: `docs/RATIONALE.md` R1).
   default branch — under any flag, setting, or tier.
 - 🚫 Pass the inherited environment to a child `claude` process, or widen the
   allowlist without a `docs/DESIGN.md` §2 change in the same PR.
-- 🚫 Run `claude -p` outside a `ticket-*` worktree, or against this repo itself.
+- 🚫 Run `claude -p` in the main checkout — only ever inside a `ticket-*` worktree.
 - 🚫 Write the audit log from inside the worktree, or from session-reported content.
-- 🚫 Run the ticket-to-PR loop against a repo other than the one configured — and never
-  against `ClaudeAssistant` while developing it.
+- 🚫 Run the ticket-to-PR loop against a repo other than the one configured
+  (`docs/PRD.md` §4 "Ticket source"). This repo is the configured one.
 - 🚫 Store the API key anywhere but Keychain; log it, echo it, or put it in a fixture.
 - 🚫 Change a test to make it pass.
