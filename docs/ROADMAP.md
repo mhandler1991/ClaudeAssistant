@@ -67,7 +67,8 @@ observed working or an issue with a repro.
 
 ### Phase 4 — Interpretation layer (dev signal only)
 
-Local LLM via Ollama (`localhost:11434`) reads the hook/transcript stream and produces
+Local LLM via Ollama (endpoint: `CLAUDE.md` §1) reads the hook/transcript stream and
+produces
 observations ("same test failed 4 times", "session has been in a fix-run-fail loop for
 12 minutes"). Surfaced in the popover as banners. No general-activity signal yet.
 
