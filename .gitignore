@@ -1,0 +1,16 @@
+# SwiftPM
+.build/
+.swiftpm/
+*.xcodeproj/
+*.xcworkspace/
+DerivedData/
+
+# macOS
+.DS_Store
+
+# Claude Code — personal overrides stay local
+.claude/settings.local.json
+
+# Never
+.env
+*.pem
