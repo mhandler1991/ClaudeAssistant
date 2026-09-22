@@ -91,6 +91,8 @@ Two limits on what "exactly the allowlist" means:
 |---|---|---|
 | Worktrees | `~/Library/Application Support/ClaudeAssistant/worktrees/ticket-{issue}/` | `Worktree/` creates; relaunch reconciliation matches on the `ticket-` prefix and ignores anything else in the directory |
 | Audit log | `~/Library/Application Support/ClaudeAssistant/audit/{yyyy-mm-dd}T{hhmmss}-ticket-{issue}.json` | `Audit/`, app process only. One file per run, written at the end and on every state transition (overwrite, same file) so a crash mid-run still leaves a partial record |
+| Run log + stderr | `~/Library/Application Support/ClaudeAssistant/runs/ticket-{issue}.jsonl` and `.stderr` | `Session/`. Outside the worktree so the session cannot edit its own record |
+| Lifted permission settings | `~/Library/Application Support/ClaudeAssistant/runs/ticket-{issue}.settings.json` | `Session/`. A copy of the target repo's committed `.claude/settings.json`, passed back with `--settings` (§3). Outside the worktree so the session cannot rewrite what it is allowed to do, mid-run |
 | Session transcript | Wherever `claude` writes it (`~/.claude/projects/…`); the audit record stores the path, not the content | `claude` |
 | App logs | Unified logging, subsystem = bundle id | `os.Logger` |
 | API key | Keychain, service `ClaudeAssistant`, account `anthropic` | 👤 you put it there once; the app reads, never writes |
@@ -123,8 +125,8 @@ prevention — the real containment is the environment allowlist and the worktre
 ## 3. Session protocol
 
 How the app talks to `claude -p`. Every flag here was checked against `claude` 2.1.273
-by `scripts/ticket-to-pr.sh` (issue #2); update this section from the script's real
-behavior, not from memory.
+by `scripts/ticket-to-pr.sh` (issues #2 and #15); update this section from the script's
+real behavior, not from memory.
 
 **Invocation** (cwd = the ticket worktree):
 
@@ -133,7 +135,10 @@ claude -p "{assembled prompt}"
        --output-format stream-json
        --verbose
        --max-turns {Constants.maxTurns}
+       --setting-sources user
+       [--settings {the target repo's own settings, lifted out of the worktree}]
        [--permission-mode {only if the target repo sets one; never bypassPermissions}]
+       < /dev/null
 ```
 
 Flag notes, all observed rather than assumed:
@@ -152,17 +157,64 @@ Flag notes, all observed rather than assumed:
   omitted so `claude` uses the repo's settings unmodified. A repo that asks for
   `bypassPermissions` is **refused with an error**, not silently downgraded — a silent
   downgrade would mean the run did something other than what the repo asked, unannounced.
+  The value is read from the *lifted* copy described below, so the mode that is checked
+  and the mode the session gets are the same bytes. The flag is belt-and-braces now that
+  the whole settings file is passed — it costs nothing and cannot disagree with the file,
+  since both come from that one copy.
 - **Headless permission prompts deny, they do not hang.** With the default
   `--permission-prompts host` and no SDK host attached, anything that would prompt is
   auto-denied, the session is told so, and it finishes normally (`is_error: false`,
   `terminal_reason: "completed"`). Denials are listed in the result line's
   `permission_denials` array — which is what `Audit/` should record. No watchdog is
   needed for a prompt-shaped hang.
-- **A fresh worktree is an untrusted workspace**, so the target repo's own
-  `permissions.allow` list is ignored entirely (`Ignoring N permissions.allow entries
-  from .claude/settings.json: this workspace has not been trusted`). This currently
-  defeats the "borrow the repo's permission model" plan; resolving it is issue #15 and
-  blocks #4 in practice.
+- **stdin is `/dev/null`, never inherited.** The prompt arrives via `-p` and the
+  session has nothing to read, but `claude` waits 3 seconds for inherited stdin and
+  warns on stderr whenever it is not a TTY — which is every scripted or app-driven
+  run. Missed in #2 because those runs were driven from a terminal (issue #18).
+
+**A fresh worktree is an untrusted workspace — decided (issue #15).** Every run creates
+a brand-new directory, which `claude` has never seen, so it refuses to honor that
+directory's `.claude/settings.json` and says so: `Ignoring 23 permissions.allow entries
+from .claude/settings.json: this workspace has not been trusted`. The allow list is
+dropped outright and anything needing it is auto-denied — observed: the session could
+not run `git` or the repo's own `bash -n` check. That defeats `PRD.md` §3 principle 5
+for permissions specifically. Three options were weighed:
+
+| Option | Verdict |
+|---|---|
+| **(a)** Mark each worktree trusted in `~/.claude.json` (`projects["…"].hasTrustDialogAccepted`) | **Rejected.** It makes the app write to a config file `claude` owns, granting blanket workspace trust on the user's behalf to a directory they never saw — and blanket trust is broader than the permission set we actually want applied. It also read-modify-writes a file a running `claude` may be writing concurrently, and leaves one accumulated entry per worktree forever |
+| **(b)** `--allowedTools` from a list the app owns | **Rejected.** This *is* reimplementing the repo's permission model in the app, which principle 5 exists to prevent. `--allowedTools` is additive only, so the repo's `deny` entries would still be dropped, and an app-owned list drifts from the repo's `settings.json` silently — the app would grant permissions the repo had since revoked |
+| **(c)** Pass the repo's own settings file with `--settings` | **Chosen.** A settings file named on the command line comes from the invoker, not from the workspace, so it is honored in full — `allow` *and* `deny` |
+
+How (c) is implemented, and why each half is needed:
+
+- The worktree's `.claude/settings.json` is **copied out to
+  `{worktree parent}/../runs/ticket-{n}.settings.json`** and that copy is what
+  `--settings` names. Same reason the run log lives there: the session must not be able
+  to rewrite the file that decides what it is allowed to do, mid-run. It also means the
+  file the script inspects for a forbidden `bypassPermissions` is byte-for-byte the file
+  the session is spawned with, rather than a second read of something editable.
+- **`--setting-sources user` is required as well.** `--settings` alone restores the
+  permissions but does *not* silence the warning — `claude` still reads the in-worktree
+  copy as a project source and reports dropping it. Naming only `user` stops that second
+  read. Project settings reach the session through `--settings` instead, so nothing is
+  lost; the whole file is lifted, not just its `permissions` block, so hooks, `env` and
+  model settings come through too.
+
+**Nothing is widened.** The lifted file is a byte-for-byte copy of what the repo already
+grants itself, and `bypassPermissions` is still refused outright. Verified on `claude`
+2.1.273 against a real fresh worktree, no `ALLOWED_TOOLS` set:
+
+| Command the session tried | Outcome | Why |
+|---|---|---|
+| `bash -n scripts/ticket-to-pr.sh` | ✅ ran | `Bash(bash -n:*)` is in the repo's allow list |
+| `git status --short` | ✅ ran | `Bash(git status:*)` is in the repo's allow list |
+| `chmod 700 README.md` | 🚫 denied | in neither list — the allow list stayed narrow |
+| `bash -n scripts/ticket-to-pr.sh; echo "exit=$?"` | 🚫 denied | *"the following part requires approval: `echo …`"* — `claude`'s own matcher refusing a compound command whose second half matches no entry. This is the repo's model working, not a gap; a session that hits it simply reruns the bare command, which is what this one did |
+
+Run stderr was empty and `permission_denials` listed exactly the two refusals above. A
+separate probe confirmed `deny` survives the same path: with `Bash(chmod:*)` denied, the
+session's `chmod` was refused and the target file's mode was unchanged.
 
 **Ceilings** — either tripping kills the process group and transitions to Error:
 
@@ -286,10 +338,10 @@ Technical and security. Product-level risks are `PRD.md` §6.
 |---|---|
 | **Prompt injection via issue text** | Mitigated by the delimited data block (§2) and by Claude Code's own permission model. Not eliminable: a sufficiently persuasive issue body can still steer what the session *writes to the worktree*. Containment is the worktree + env allowlist + human review at the confirm gate — a bad diff never reaches `main` without a person reading it. Standing: accepted for a single-owner repo; a redesign trigger per `PRD.md` §4 the moment anyone else can label issues. |
 | **Secret leakage into the session** | Allowlist env (§2), tested. Residual: `HOME` is passed, so anything `claude` or `git` reads from `~` is reachable by the session. Standing: accepted; the alternative (a synthetic `HOME`) breaks `claude`'s own config and is Phase 3 hardening if a run ever shows it matters. |
-| **`claude -p` / `stream-json` contract drift** | The app depends on undocumented-ish output shapes. Standing: unknown types are skipped, not fatal (§3); a version pin for `claude` is recorded in the audit record so a drift is diagnosable. If it drifts more than once, the SDK becomes the fallback (§1 ruled-out list). |
+| **`claude -p` / `stream-json` contract drift** | The app depends on undocumented-ish output shapes, and now on `--settings` and `--setting-sources` behaving as §3 describes. Standing: unknown types are skipped, not fatal (§3); a version pin for `claude` is recorded in the audit record so a drift is diagnosable. If it drifts more than once, the SDK becomes the fallback (§1 ruled-out list). |
 | **Runaway session survives the ceiling** | ✅ **Demonstrated on macOS** (§3): with job control enabled the child is a process-group leader, and `kill -TERM -$pid` took down `claude` and a 600-second grandchild together. Standing: closed for the script. Reopens for Phase 1 — `Process` does not put a child in its own process group by default, so `Session/` has to do it explicitly and prove it again. |
 | **The API key is visible in `env`'s argv** | `env -i ANTHROPIC_API_KEY=… claude` exposes the value to `ps` for the length of the run. Standing: accepted — single user, single machine, and the OAuth path means no key is in use today. Fix if it matters: have the child read Keychain itself behind `sh -c`, so the value never appears on a command line. |
-| **The target repo's permission settings never apply** | A worktree is a new directory every run, so `claude` treats it as an untrusted workspace and ignores the repo's `permissions.allow` entirely (§3). Standing: open, issue #15 — it defeats `PRD.md` §3 principle 5 for permissions specifically, and blocks the test run in #4. |
+| **The target repo's permission settings never apply** | ✅ **Closed, issue #15** (§3). The repo's own `.claude/settings.json` is lifted out of the worktree and passed back with `--settings`, with `--setting-sources user` stopping the untrusted second read. Verified in a real fresh worktree: allow-listed commands run, non-listed ones are denied, `deny` still bites, stderr is clean. Residual: this depends on `--settings` continuing to be exempt from the workspace-trust check — same contract-drift risk as the row above, and it fails *closed* (back to everything denied) rather than open. |
 | **Worktree left dirty / branch left on remote after a failed run** | Standing: the app never deletes worktrees (pruning is 🔮); a failed run leaves its branch local-only because push happens after confirm. Nothing reaches GitHub without a person. |
 | **`gh` auth is the user's full auth** | The app's own `gh` calls run with whatever scopes the user's `gh auth login` granted — broader than the app needs. Standing: accepted for one owner on one repo; the app only ever calls `issue list/view`, `issue edit --add-label`, `pr create --draft`. Any new `gh` verb is a `CLAUDE.md` §12 review. |
 | **Hook / transcript reliability (Phase 2)** | Hooks can be disabled by the target repo's own settings; the transcript path may change. Standing: unknown until Phase 2; Running degrades to the Phase 1 black-box view rather than failing. |
