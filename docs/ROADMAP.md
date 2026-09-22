@@ -100,8 +100,17 @@ phase here.
 
 ## Current status
 
-**Active: Phase 0.** Nothing built yet. First job is `scripts/ticket-to-pr.sh` and
-three real runs against this repo's own issues.
+**Active: Phase 0.** `scripts/ticket-to-pr.sh` exists and runs. It creates the
+worktree and branch, assembles the prompt from the issue as a delimited data block,
+spawns the headless session with an allowlist environment and the target repo's own
+permission settings, enforces both ceilings, and derives the run's outcome from what
+it observed rather than from what the session reported. What the phase still owes is
+the post-session test run and the confirm-gated draft PR, the per-run audit record,
+and the three real runs themselves — the query below is the current list, so it can't
+go stale here.
+
+The **done-when bar above is unchanged and still unmet**. None of the above clears it:
+the script has never been driven end to end through a PR.
 
 ```bash
 gh issue list --milestone "Phase 0 - Mechanism"    # what this phase still owes
