@@ -282,6 +282,60 @@ Run stderr was empty and `permission_denials` listed exactly the two refusals ab
 separate probe confirmed `deny` survives the same path: with `Bash(chmod:*)` denied, the
 session's `chmod` was refused and the target file's mode was unchanged.
 
+**The lifted file has to actually grant file edits — decided (issue #23).** Restoring the
+repo's permissions was necessary and not sufficient. All 23 of this repo's `allow`
+entries were `Bash(...)`, none granted `Write` or `Edit`, and no allow-listed shell
+command could create a file either. Observed on a real run (2026-09-22, `claude`
+2.1.273): the session was asked to create one file and commit it, did neither, and
+`permission_denials` carried exactly one entry — the `Write` call. Everything else
+behaved: outcome `completed`, tests passed, the "committed nothing" guard stopped the run
+before the confirm gate, nothing was pushed. An interactive session never needed such a
+rule, because the trust dialog and in-flight approval cover it, so the gap only exists
+headless. Two options:
+
+| Option | Verdict |
+|---|---|
+| **(a)** The script adds a `Write`/`Edit` entry to the lifted copy, leaving the repo's committed settings untouched | **Rejected.** This is the objection that killed option (b) above wearing a different hat: the app granting permissions the repo did not. It is in one way worse, because the widening would appear in no file a human reviews — the repo's committed settings would still read as edit-less, and the only place the session's real permission set existed would be a generated file in the runs directory. It also makes the script's one *checkable* safety claim — that the lifted copy is byte-for-byte the repo's own — false, and a claim that can be verified by diffing two files is worth more than a comment asserting the widening is small |
+| **(b)** Commit the entries to the repo's own `.claude/settings.json` | **Chosen.** The repo states its own permission model, the script goes on copying it verbatim, and principle 5 holds: the permission model is Claude Code's and the repo's, never the app's |
+
+**The entries are `Edit(**)` and `Write(**)`, not bare `Edit` and `Write`** — and the
+glob is doing real work. Observed: a relative path pattern in a file named by `--settings`
+resolves against the **session's cwd**, which is the worktree, not against the directory
+holding the lifted file. So the session may edit anything inside its own worktree and
+nothing outside it. That distinction is the point rather than a refinement: the runs
+directory holds the audit log *and* the lifted settings file, and the whole reason both
+live outside the worktree is that the session must not be able to rewrite either one
+mid-run. A bare `Write` entry would hand that back, making the lift decorative.
+
+Verified on `claude` 2.1.273, settings passed by `--settings` from outside the working
+directory, no `ALLOWED_TOOLS` set:
+
+| What the session tried | Outcome | Why |
+|---|---|---|
+| Create `hello.txt` in the working directory | ✅ created | `Write(**)` resolves against cwd |
+| Edit an existing file in the working directory | ✅ changed | `Edit(**)`, same resolution |
+| Create a file at an absolute path in the runs directory | 🚫 denied | outside cwd — the glob does not reach it, and `permission_denials` named the `Write` and its absolute path |
+| Create a file the lifted copy names in `deny` | 🚫 denied | `deny` still outranks `allow` for the file tools, not only for `Bash` |
+
+`bypassPermissions` is refused exactly as before: the script reads `permissions.defaultMode`
+from the lifted copy and dies rather than passing it. Nothing in this decision touches
+that path, and nothing in it gives the script a way to add a permission of its own.
+
+**The cost, stated plainly:** interactive sessions in the main checkout now edit files
+without prompting too, since it is one settings file and it is not headless-only. That is
+a real widening of the day-to-day loop, accepted deliberately — it is visible in git,
+reviewable in a pull request, and revertible by deleting two lines. None of those three
+things is true of a widening the script performs at spawn time, which is the whole reason
+(a) lost.
+
+**Applying it is a human's job, and not by choice.** Claude Code's own auto-mode
+classifier refuses any edit to `.claude/settings.json` from a session governed by it —
+`Reason: [Self-Modification]` — through `Edit` and through a shell redirect alike, and an
+in-session approval does not lift it. So the two entries above were added by hand. Worth
+knowing before a future session plans around editing this file, and worth noting that the
+guard and option (b) agree: a change to what an agent may do belongs in a file a human
+edits and reviews, not in one the agent writes for itself on the way past.
+
 **Ceilings** — either tripping kills the process group and transitions to Error:
 
 - Wall clock: `Constants.wallClockCeiling` (starting value: `PRD.md` §4). Enforced by our
