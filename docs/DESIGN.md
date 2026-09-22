@@ -61,7 +61,7 @@ the `USER` row is a Phase 0 correction to the original plan:
 | Variable | Source | Why it's needed |
 |---|---|---|
 | `PATH` | Fixed string — `/usr/bin:/bin:/usr/sbin:/sbin:/usr/local/bin:/opt/homebrew/bin` plus the directory containing `claude` | Session must find `git`, the test runner, and `claude` |
-| `HOME` | Inherited | `claude` reads `~/.claude/` for its own config; `git` reads `~/.gitconfig` |
+| `HOME` | Inherited | `claude` reads `~/.claude/` for its own config; `git` reads `~/.gitconfig`. Phase 0's script takes a `CHILD_HOME` override for probe runs — it changes this variable's *value*, never the allowlist, and pointing it at a directory with no Claude login is how an auth failure is reproduced on demand (issue #17, §3) |
 | `TMPDIR`, `LANG` | Inherited | Toolchain hygiene |
 | `USER` | Inherited | **Phase 0 finding.** Without it `claude` cannot read its own OAuth credentials from the login Keychain and exits with `Not logged in · Please run /login` — even though `HOME` is passed. `LOGNAME` and `SHELL` are *not* substitutes; only `USER` works |
 | `ANTHROPIC_API_KEY` | Keychain (`security find-generic-password -s ClaudeAssistant -a anthropic -w`), read by the app at spawn | The session's API-key auth path. Injected per-spawn, never persisted in a file. **Optional in practice:** when the item is absent, `claude` authenticates with the OAuth login in `$HOME` instead, which is how every Phase 0 run so far has authenticated |
@@ -104,9 +104,10 @@ yet — persistence and cross-run reads are 🔮 Phase 5's trigger, and this fil
 
 **Phase 0 already writes this shape from the script** (issue #5), carrying the subset of
 fields a script can observe: issue number, worktree path, branch, session start and end,
-exit reason, test command and exit code, confirm decision, PR URL, transcript path, and
-`claude --version`. Three properties of it are worth carrying into `Audit/` rather than
-rediscovering, each verified on a real run:
+exit reason, the API-error evidence behind it (`api_error`, `terminal_reason`,
+`api_error_status` — §3), test command and exit code, confirm decision, PR URL,
+transcript path, and `claude --version`. Four properties of it are worth carrying into
+`Audit/` rather than rediscovering, each verified on a real run:
 
 - **Rewritten whole at every stage** — worktree created, session exited, tests done, gate
   answered, PR opened — so a crash leaves the previous stage's record rather than none.
@@ -118,6 +119,9 @@ rediscovering, each verified on a real run:
   directory name under `~/.claude/projects` is undocumented, so the script takes the
   session id from the stream — a machine-readable field, not prose — searches for the
   file it names, and records the path only if the file is really there.
+- **Evidence is recorded even when it could not be labelled.** `api_error` holds the raw
+  enum value `claude` reported whether or not it mapped onto a sub-reason, so a run this
+  script had to fall back on still leaves behind the thing it fell back on (§3).
 
 ### Issue text is data
 
@@ -325,27 +329,80 @@ works, and that the script implements:
 
 All five rows were exercised against real runs in Phase 0. Note that the ceiling check
 comes first: a killed session has no `result` line, so the two would otherwise collide.
+A `task_failure` is then refined into a sub-reason by the table further down; no other
+outcome is.
 
 **The run log lives outside the worktree.** `{worktree parent}/../runs/ticket-{n}.jsonl`,
 with stderr beside it as `.stderr`, so the session cannot edit its own record
 (`CLAUDE.md` §12).
 
-**Failure sub-reasons** (from `PRD.md` §4, decided in `Session/`, never by the session):
+**Failure sub-reasons** (from `PRD.md` §4, decided in `Session/`, never by the session).
+Settled in issue #17; the stderr plan and the `terminal_reason` fallback below it were
+both wrong, and what replaced them is better than either:
 
 | Sub-reason | Detected by |
 |---|---|
-| `task_failure` | `result.is_error`, or the target repo's test command exits non-zero |
-| `auth_expired` | ⚠️ **Not on stderr.** An auth failure exits 1 with an *empty* stderr and reports itself inside the result line: `terminal_reason: "api_error"` and `result: "Not logged in · Please run /login"`. `terminal_reason` is the machine-readable half and the only part worth matching on |
-| `rate_limited` | A rate-limit-shaped API error in the stream. Note that `rate_limit_event` lines appear in ordinary healthy runs too, so their presence alone means nothing |
+| `task_failure` | `result.is_error`, or the target repo's test command exits non-zero — and the fallback for every API error that is neither of the two below |
+| `auth_expired` | The **last top-level `assistant` line** carries `error: "authentication_failed"` |
+| `rate_limited` | The same field on the same line carries `error: "rate_limit"` |
 | `ceiling_wall_clock` / `ceiling_max_turns` | The app's own timer, or `result.subtype == "error_max_turns"` |
 
-The original plan had `auth_expired` and `rate_limited` detected by pattern-matching
-stderr; Phase 0 showed stderr is empty in exactly that case, so both have to come from
-the result line instead. `terminal_reason` (`completed` / `api_error` / `max_turns`
-observed so far) is more promising than prose matching, but it is still undocumented
-surface — Phase 3 replaces this with whatever Phase 0–2 runs show is actually
-distinguishable. Phase 0's script does not yet split these out: both land as
-`task_failure`.
+**The field is `error` on the assistant message, and it is a real contract.** `claude`
+emits a synthetic `assistant` line when an API error ends a turn, and that line carries a
+top-level `error` field — a sibling of `message`, not something inside it — validated
+against a fixed thirteen-member enum: `authentication_failed`, `oauth_org_not_allowed`,
+`account_on_hold`, `verification_required`, `billing_error`, `rate_limit`, `overloaded`,
+`invalid_request`, `model_not_found`, `server_error`, `unknown`, `max_output_tokens`,
+`cloud_credential_error`. It is the same field `claude`'s own `StopFailure` hook matches
+on to say which API error ended a turn, which is precisely the question this table asks.
+That makes it a much sounder bet than the three candidates it beat:
+
+| Candidate | Why not |
+|---|---|
+| **stderr** | The original plan. Empty on a real auth failure — disproved in #2, re-confirmed in #17 |
+| **`result.terminal_reason`** | The #17 starting candidate. It buckets all thirteen enum members into one value, `api_error`, so it can say *that* an API error ended the run but never *which* |
+| **`result.result` prose** | `"Not logged in · Please run /login"` is a sentence written for a human and rewritten whenever the wording improves |
+
+**Why the *last top-level assistant* line, and not "a rate-limit-shaped thing in the
+stream".** This is the trap #2 flagged, and three separate things in a healthy stream
+would spring it:
+
+- `rate_limit_event` lines appear in ordinary healthy runs. They are not `assistant`
+  lines and are never read.
+- A rate limit or overload that `claude` **waited out and retried** emits
+  `system` / `api_retry`, which carries this same enum in its own `error` field plus an
+  `error_status`. Also not an `assistant` line, also never read.
+- A run that recovered from an API error produced further `assistant` messages
+  afterwards, so the error is no longer the last one.
+
+`parent_tool_use_id` must be `null` as well: a subagent's API error is not the main
+loop's terminal state. `claude`'s own code makes that same check.
+
+**Corroboration, recorded but not trusted.** The audit record also stores
+`result.terminal_reason` and `result.api_error_status`, because a sub-reason that later
+turns out wrong is only diagnosable against what the result line said at the time. Note
+that `api_error_status` was `null` on the observed auth failure — an expired *local*
+login never reaches the API, so there is no HTTP status to report (`duration_api_ms: 0`).
+A 429 would carry one. That is exactly why the status cannot be the authority.
+
+**Anything unmapped stays `task_failure`, and says so.** The other eleven enum members
+are real API errors, but none of them is an expired login or a rate limit, so none of
+them gets one of those two labels — a wrong label is worse than a coarse one
+(`PRD.md` §4). The raw `error` value is still written to the audit record's `api_error`
+field and printed, so the fallback loses the label and never the finding.
+
+**What was observed, and what was not** — stated plainly, per `ROADMAP.md`
+"How to iterate":
+
+| Claim | Standing |
+|---|---|
+| `auth_expired` from a real auth failure | ✅ **Observed end to end** on `claude` 2.1.273. `CHILD_HOME` pointed at a directory with no Claude login; the run recorded `exit_reason: auth_expired`, `api_error: authentication_failed`, `terminal_reason: api_error`, `api_error_status: null`, stderr empty, in 1 second |
+| A healthy run carrying `rate_limit_event` lines is **not** labelled `rate_limited` | ✅ **Observed** against fixtures through `CLASSIFY_ONLY`, including the retried-then-recovered case and a subagent-only error |
+| `rate_limited` from a real rate limit | ⚠️ **Reasoned about, not observed.** No real 429 was produced. The mapping rests on `claude`'s own classifier — `status === 429 → "rate_limit"` — and on the enum above, and was exercised against a fixture whose *shape* is the captured auth-failure line with the enum value swapped. Confirm it against a real rate limit before relying on it |
+
+The ceiling check still comes first, and only an outcome that is already `task_failure` is
+refined: a tripped ceiling and an unrecognized subtype are the app's own observations and
+are never reinterpreted.
 
 **After exit, in order:** run the target repo's test command if one is configured →
 pass: transition to *PR ready* (confirm gate) · fail: *Error*, `task_failure`, stop.
