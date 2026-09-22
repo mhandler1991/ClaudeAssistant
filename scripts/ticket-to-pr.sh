@@ -25,6 +25,24 @@
 #                                spawning nothing. This is how the delimiter is
 #                                inspected against a real issue body without
 #                                spending a session (issue #3).
+#   CLASSIFY_ONLY    (optional)  Path to an existing run log. Print which API
+#                                error, if any, ended that run and which failure
+#                                sub-reason it maps to, then exit 0 — no
+#                                worktree, no session, no issue number needed.
+#                                A probe escape hatch: it is how the rate-limit
+#                                branch is exercised against a captured or
+#                                constructed stream without waiting for a real
+#                                rate limit (issue #17). It answers "what ended
+#                                this run", so a healthy log correctly answers
+#                                "none"; it does not re-derive the run's outcome,
+#                                which needs the exit code and this script's own
+#                                clock as well.
+#   CHILD_HOME       (optional)  Value for the child's HOME. A probe escape
+#                                hatch: pointing it at a directory with no Claude
+#                                login is how a real auth failure is reproduced
+#                                on demand (issue #17). A production run sets
+#                                nothing and the session gets $HOME, which is
+#                                what docs/DESIGN.md §2 specifies.
 #   WALL_CLOCK_CEILING_SECONDS, MAX_TURNS  (optional)
 #                                Override the ceilings below. They exist so a
 #                                probe run can trip a ceiling in under a minute;
@@ -124,6 +142,13 @@ readonly SETTING_SOURCES="user"
 # Prefix stamped onto a line of issue text that reproduces one of the data-block
 # delimiters, so the line cannot close the block early (docs/DESIGN.md §2).
 readonly ESCAPE_MARKER="[escaped]"
+# The two values of claude's assistant-message `error` field that map onto a
+# docs/PRD.md §4 failure sub-reason. They are members of a fixed enum claude
+# validates its own output against (issue #17, docs/DESIGN.md §3); the other
+# eleven members are real API errors too, but none of them is an expired login
+# or a rate limit, so none of them gets one of these two labels.
+readonly API_ERROR_AUTH_EXPIRED="authentication_failed"
+readonly API_ERROR_RATE_LIMITED="rate_limit"
 
 # Every error is shaped to be pasted straight back into a Claude session:
 # where it happened, what was expected, what was actually found, and a fix.
@@ -164,12 +189,79 @@ wait_with_ceiling() {
   return 0
 }
 
+# Prints the API error that *ended* the run described by run log $1, or nothing.
+#
+# claude's SDK assistant message carries a top-level `error` field: optional,
+# present only on the synthetic message that wraps an API error, and validated
+# against a fixed enum — authentication_failed, oauth_org_not_allowed,
+# account_on_hold, verification_required, billing_error, rate_limit, overloaded,
+# invalid_request, model_not_found, server_error, unknown, max_output_tokens,
+# cloud_credential_error (read out of claude 2.1.273's own schema, issue #17).
+# It is the same field claude's StopFailure hook matches on to say which API
+# error ended a turn, which is exactly the question being asked here. That makes
+# it a far better bet than the result line's `terminal_reason`, which buckets
+# every one of those thirteen into "api_error", and than the `result` prose,
+# which is a sentence written for a human.
+#
+# Why the *last top-level assistant* line specifically, and not "any line that
+# mentions a rate limit" — this is the trap issue #2 flagged:
+#
+#   - `rate_limit_event` lines appear in ordinary healthy runs. They are not
+#     assistant messages and are not read here at all.
+#   - A rate limit or an overload that claude waited out and retried emits a
+#     `system` line with subtype `api_retry`, which carries this same enum in
+#     its own `error` field. Also not an assistant message, also not read here.
+#   - A run that recovered from an API error went on to produce further
+#     assistant messages, so the error is no longer the last one.
+#
+# Only an API error that was still the session's last word survives all three.
+# parent_tool_use_id must be null because a subagent's API error is not the main
+# loop's terminal state — claude's own code makes that same check.
+#
+# A malformed line is skipped rather than fatal, the same as everywhere else
+# this script reads the stream (docs/DESIGN.md §3).
+terminal_api_error() {
+  jq -r -R '
+    fromjson?
+    | select(.type == "assistant" and .parent_tool_use_id == null)
+    | .error // ""
+  ' "$1" 2>/dev/null | tail -1
+}
+
+# Maps the terminating API error $1 onto a docs/PRD.md §4 failure sub-reason.
+#
+# Only the two sub-reasons the PRD names are mapped. Every other member of the
+# enum — and the empty string, meaning no API error ended this run — stays
+# task_failure, because a wrong label is worse than a coarse one (issue #17).
+# The raw value is recorded in the audit record either way, so falling back here
+# loses the label but never the finding.
+sub_reason_for_api_error() {
+  case "$1" in
+    "$API_ERROR_AUTH_EXPIRED") printf 'auth_expired\n' ;;
+    "$API_ERROR_RATE_LIMITED") printf 'rate_limited\n' ;;
+    *)                         printf 'task_failure\n' ;;
+  esac
+}
+
 # --- inputs -----------------------------------------------------------------
 
 command -v git >/dev/null \
   || die "PATH" "git on PATH" "not found" "install Xcode command-line tools"
 command -v jq >/dev/null \
   || die "PATH" "jq on PATH" "not found" "brew install jq"
+
+# A dry run over a stream this script did not just produce. Placed here because
+# it needs neither an issue number nor claude on PATH — it reads a file and
+# answers one question about it. Nothing is created and nothing is spawned.
+if [[ -n "${CLASSIFY_ONLY:-}" ]]; then
+  [[ -f "$CLASSIFY_ONLY" ]] \
+    || die "CLASSIFY_ONLY" "a readable run log to classify" "no file at '$CLASSIFY_ONLY'" \
+           "pass the path to a stream-json run log, e.g. .../runs/ticket-17.jsonl"
+  classified="$(terminal_api_error "$CLASSIFY_ONLY")"
+  printf 'api error:   %s\n' "${classified:-none}"
+  printf 'sub-reason:  %s\n' "$(sub_reason_for_api_error "$classified")"
+  exit 0
+fi
 
 # A ceiling that isn't a positive integer is a disabled ceiling, which is the one
 # thing this script exists to prevent — so it is an error, not a fallback.
@@ -229,6 +321,16 @@ audit_file="$audit_dir/$(date -u +%Y-%m-%dT%H%M%S)-$branch.json"
 session_started_at=""
 session_ended_at=""
 exit_reason=""
+# The evidence behind exit_reason when the session hit an API error (issue #17).
+# api_error is the value of the enum field claude put on its own last assistant
+# message; terminal_reason and api_error_status are the result line's coarser
+# corroboration. All three are machine-readable fields of the stream, never
+# prose the session wrote (docs/DESIGN.md §3). They are recorded even when the
+# sub-reason falls back to task_failure, so a run that this script could not
+# label still leaves behind the thing it could not label.
+api_error=""
+terminal_reason=""
+api_error_status=""
 test_command="${TEST_COMMAND:-}"
 test_exit_code=""
 confirm_decision=""
@@ -255,6 +357,9 @@ audit_write() {
     --arg session_started_at "$session_started_at" \
     --arg session_ended_at "$session_ended_at" \
     --arg exit_reason "$exit_reason" \
+    --arg api_error "$api_error" \
+    --arg terminal_reason "$terminal_reason" \
+    --arg api_error_status "$api_error_status" \
     --arg test_command "$test_command" \
     --arg test_exit_code "$test_exit_code" \
     --arg confirm_decision "$confirm_decision" \
@@ -271,6 +376,9 @@ audit_write() {
       session_started_at: ($session_started_at | blank_is_null),
       session_ended_at: ($session_ended_at | blank_is_null),
       exit_reason: ($exit_reason | blank_is_null),
+      api_error: ($api_error | blank_is_null),
+      terminal_reason: ($terminal_reason | blank_is_null),
+      api_error_status: ($api_error_status | blank_is_null_number),
       test_command: ($test_command | blank_is_null),
       test_exit_code: ($test_exit_code | blank_is_null_number),
       confirm_decision: ($confirm_decision | blank_is_null),
@@ -507,9 +615,14 @@ fi
 # from empty and every variable below is named on purpose.
 
 child_path="$(dirname "$claude_bin"):$CHILD_PATH"
+# docs/DESIGN.md §2 says the child's HOME is this process's HOME. CHILD_HOME
+# overrides the value, not the allowlist — HOME is still exactly one variable,
+# still named on purpose. Pointing it at a directory with no Claude login is the
+# only way to reproduce an auth failure on demand (issue #17).
+child_home="${CHILD_HOME:-$HOME}"
 child_env=(
   "PATH=$child_path"
-  "HOME=$HOME"
+  "HOME=$child_home"
   "TMPDIR=${TMPDIR:-/tmp}"
   "LANG=${LANG:-en_US.UTF-8}"
   "USER=${USER:-$(id -un)}"
@@ -518,6 +631,10 @@ child_env=(
 # The API key is the one secret the session gets, and only if it is in Keychain.
 # When it is absent, claude falls back to the OAuth login in ~/.claude, which it
 # finds via Keychain — but only when USER is set (docs/DESIGN.md §2).
+if [[ "$child_home" != "$HOME" ]]; then
+  note "auth: CHILD_HOME is set — the session's HOME is $child_home, not yours (probe escape hatch)"
+fi
+
 api_key=""
 if api_key="$(security find-generic-password -s "$KEYCHAIN_SERVICE" -a "$KEYCHAIN_ACCOUNT" -w 2>/dev/null)"; then
   child_env+=("ANTHROPIC_API_KEY=$api_key")
@@ -593,10 +710,20 @@ result_json="$(jq -c -R 'fromjson? | select(.type == "result")' "$run_log" 2>/de
 subtype=""
 is_error=""
 num_turns=""
+# Recorded, not branched on. terminal_reason is the result line's own one-word
+# verdict and api_error_status its HTTP status; both are machine-readable and
+# both corroborate the sub-reason derived below, but neither is authoritative
+# here — terminal_reason buckets all thirteen API errors into "api_error", and
+# api_error_status is null for a failure that never reached the API at all,
+# which is exactly what an expired local login is (issue #17).
+terminal_reason=""
+api_error_status=""
 if [[ -n "$result_json" ]]; then
   subtype="$(printf '%s' "$result_json" | jq -r '.subtype // empty')"
   is_error="$(printf '%s' "$result_json" | jq -r '.is_error // empty')"
   num_turns="$(printf '%s' "$result_json" | jq -r '.num_turns // empty')"
+  terminal_reason="$(printf '%s' "$result_json" | jq -r '.terminal_reason // empty')"
+  api_error_status="$(printf '%s' "$result_json" | jq -r '.api_error_status // empty')"
 fi
 
 if [[ -z "$outcome" ]]; then
@@ -623,7 +750,27 @@ if [[ -z "$outcome" ]]; then
   fi
 fi
 
+# --- the failure sub-reason (issue #17) --------------------------------------
+# docs/PRD.md §4 names three: task_failure, auth_expired, rate_limited. Only a
+# run that already failed as a task_failure can be refined — a tripped ceiling
+# and an unrecognized subtype are this script's own observations and are not
+# reinterpreted, and a completed run has no sub-reason to find. That guard is
+# checked here rather than assumed: task_failure is the only outcome above whose
+# cause is still unknown at this point (CLAUDE.md §2 rule 9).
+
+if [[ "$outcome" == "task_failure" ]]; then
+  api_error="$(terminal_api_error "$run_log")"
+  outcome="$(sub_reason_for_api_error "$api_error")"
+fi
+
 printf 'exit reason: %s\n' "$outcome"
+if [[ -n "$api_error" ]]; then
+  if [[ "$outcome" == "task_failure" ]]; then
+    printf 'api error:   %s — a real API error, but not one this script splits out; left as task_failure\n' "$api_error"
+  else
+    printf 'api error:   %s\n' "$api_error"
+  fi
+fi
 printf 'exit code:   %s\n' "$exit_code"
 printf 'elapsed:     %ss (ceiling %ss)\n' "$elapsed" "$WALL_CLOCK_CEILING_SECONDS"
 printf 'turns:       %s (max %s)\n' "${num_turns:-unknown}" "$MAX_TURNS"
