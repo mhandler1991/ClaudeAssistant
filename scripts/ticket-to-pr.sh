@@ -2,10 +2,12 @@
 # ticket-to-pr.sh — Phase 0 mechanism script (docs/ROADMAP.md, Phase 0).
 #
 # Given a GitHub issue number, create an isolated git worktree and branch of this
-# repo, assemble the session prompt from the issue itself, then run a headless
-# Claude Code session inside it with a stripped environment and a wall-clock
-# ceiling. Later Phase 0 issues add the post-session test run and draft PR (#4)
-# and the audit record (#5).
+# repo, assemble the session prompt from the issue itself, run a headless Claude
+# Code session inside it with a stripped environment and a wall-clock ceiling,
+# then — once the session has exited — run the target repo's test command, show
+# the human the diff, and only on an explicit y/N confirm push the branch and
+# open a draft pull request. Every run leaves one JSON audit record behind,
+# written outside the worktree.
 #
 # Usage:
 #   scripts/ticket-to-pr.sh <issue-number> [<prompt>]
@@ -27,6 +29,20 @@
 #                                Override the ceilings below. They exist so a
 #                                probe run can trip a ceiling in under a minute;
 #                                Phase 1 reads both from Constants.swift instead.
+#   TEST_COMMAND     (optional)  The target repo's test command, run inside the
+#                                worktree after the session exits — from this
+#                                script's own environment, never the session's.
+#                                Unset: the test run is skipped with a printed
+#                                note and the confirm gate is still offered.
+#                                Non-zero exit: the tail of its output is
+#                                printed, the run is recorded as task_failure,
+#                                and nothing is pushed. For this repo today
+#                                (CLAUDE.md §8) that is:
+#                                  TEST_COMMAND='bash -n scripts/ticket-to-pr.sh'
+#   TEST_CEILING_SECONDS (optional)
+#                                Ceiling for TEST_COMMAND, killed the same way
+#                                the session is — by process group, so a hung
+#                                test runner's children die with it.
 #
 # The prompt: framing, then the issue title, body and comments (oldest first)
 # inside a delimited data block whose delimiters carry the issue number, then
@@ -48,9 +64,32 @@
 # back with --settings. A fresh worktree is never a trusted workspace, so that
 # file would otherwise be ignored outright (issue #15, docs/DESIGN.md §3).
 #
+# The confirm gate: nothing reaches GitHub without an interactive "y" read from
+# /dev/tty rather than from stdin, so a piped answer cannot satisfy it and a run
+# with no terminal attached declines instead of pushing (docs/PRD.md §4, tier 3
+# "externally visible"). It is Phase 0's stand-in for the app's PR ready state
+# (docs/DESIGN.md §4), and it is a real gate here so that the success bar's
+# "zero tier-4 actions without a confirm" is measured from run one. Push and
+# `gh` both run from this script, in this script's environment, never inside the
+# session. There is no code path in this file that merges anything, and none is
+# coming (docs/PRD.md §3 principle 3).
+#
+# The audit record: one JSON object per run at
+# "$WORKTREE_PARENT/../audit/<utc timestamp>-ticket-<n>.json", rewritten whole at
+# each stage — worktree created, session exited, tests done, gate answered, PR
+# opened — so a crash mid-run leaves a partial record rather than none. Every
+# value in it is something this script observed: an exit code, its own clock, a
+# path it built, what `gh` handed back. Nothing is parsed out of the session's
+# prose (docs/DESIGN.md §3). A value not yet known is null, never absent.
+#
+# Exit status: 0 when the loop ran to its end, whether that end was an opened
+# pull request or a declined gate. 1 when the session failed or tripped a
+# ceiling, when the tests failed, or when the session left nothing committed.
+#
 # Re-running for the same issue is refused while its worktree or branch exists;
-# once those are cleaned up, a new run truncates the previous run log. Durable
-# per-run records are issue #5's job, not this file's.
+# once those are cleaned up, a new run truncates the previous run log. The audit
+# record is not truncated — its name carries the run's start time, so each run
+# gets its own file.
 
 set -euo pipefail
 
@@ -64,6 +103,13 @@ readonly WALL_CLOCK_CEILING_SECONDS="${WALL_CLOCK_CEILING_SECONDS:-1200}"
 readonly KILL_GRACE_SECONDS=5
 # Turn ceiling, enforced by claude itself via --max-turns.
 readonly MAX_TURNS="${MAX_TURNS:-40}"
+# Ceiling for the target repo's test command, seconds. Deliberately its own
+# number rather than a share of the session's: a hung test runner and a runaway
+# session are different failures and Phase 1 surfaces them separately.
+readonly TEST_CEILING_SECONDS="${TEST_CEILING_SECONDS:-600}"
+# How many lines of a failed test run's output are printed. The tail, not the
+# head — the failure is at the end.
+readonly TEST_TAIL_LINES=40
 # Fixed PATH for the child; the directory holding claude is prepended at spawn.
 readonly CHILD_PATH="/usr/bin:/bin:/usr/sbin:/sbin:/usr/local/bin:/opt/homebrew/bin"
 # Keychain item holding the API key (docs/DESIGN.md §2).
@@ -93,6 +139,31 @@ die() {
 
 note() { printf 'ticket-to-pr: %s\n' "$1" >&2; }
 
+# One timestamp format for everything this script records: UTC, seconds.
+now() { date -u +%Y-%m-%dT%H:%M:%SZ; }
+
+# Waits for $1 — a process-group leader — for at most $2 seconds, calling it $3
+# in anything it prints. On the ceiling it signals the whole group rather than
+# the pid, so a test runner or tool the child spawned dies with it
+# (docs/DESIGN.md §7): SIGTERM, KILL_GRACE_SECONDS to wind down, then SIGKILL.
+# Returns 0 if the process exited on its own, 1 if the ceiling tripped.
+wait_with_ceiling() {
+  local pid="$1" ceiling="$2" label="$3"
+  local started="$SECONDS" grace_until
+  while kill -0 "$pid" 2>/dev/null; do
+    if (( SECONDS - started >= ceiling )); then
+      note "$label: ceiling of ${ceiling}s reached after $((SECONDS - started))s — killing process group $pid"
+      kill -TERM -"$pid" 2>/dev/null || true
+      grace_until=$(( SECONDS + KILL_GRACE_SECONDS ))
+      while kill -0 "$pid" 2>/dev/null && (( SECONDS < grace_until )); do sleep 1; done
+      kill -KILL -"$pid" 2>/dev/null || true
+      return 1
+    fi
+    sleep 1
+  done
+  return 0
+}
+
 # --- inputs -----------------------------------------------------------------
 
 command -v git >/dev/null \
@@ -108,6 +179,9 @@ command -v jq >/dev/null \
 [[ "$MAX_TURNS" =~ ^[1-9][0-9]*$ ]] \
   || die "MAX_TURNS" "a positive whole number of turns" "'$MAX_TURNS'" \
          "unset it to use the default, or pass a positive integer"
+[[ "$TEST_CEILING_SECONDS" =~ ^[1-9][0-9]*$ ]] \
+  || die "TEST_CEILING_SECONDS" "a positive whole number of seconds" \
+         "'$TEST_CEILING_SECONDS'" "unset it to use the default, or pass a positive integer"
 
 claude_bin="$(command -v claude || true)"
 [[ -n "$claude_bin" ]] \
@@ -136,6 +210,80 @@ runs_dir="$(dirname "$worktree_parent")/runs"
 run_log="$runs_dir/$branch.jsonl"
 run_err="$runs_dir/$branch.stderr"
 run_settings="$runs_dir/$branch.settings.json"
+test_log="$runs_dir/$branch.test.log"
+
+# --- the audit record (issue #5) ---------------------------------------------
+# One object per run, beside the run log and equally outside the worktree, so the
+# session can no more edit its own record than it can its own transcript. The
+# name carries the run's start time (docs/DESIGN.md §2), so a second run for the
+# same issue adds a file rather than overwriting one.
+#
+# Every field below starts empty and is filled by the stage that observes it.
+# Empty becomes JSON null, never an absent key: something that reads this later
+# has to be able to tell "the run never got this far" from "the field is gone".
+
+audit_dir="$(dirname "$worktree_parent")/audit"
+# docs/DESIGN.md §2 names the shape: {yyyy-mm-dd}T{hhmmss}-ticket-{n}.json, UTC.
+audit_file="$audit_dir/$(date -u +%Y-%m-%dT%H%M%S)-$branch.json"
+
+session_started_at=""
+session_ended_at=""
+exit_reason=""
+test_command="${TEST_COMMAND:-}"
+test_exit_code=""
+confirm_decision=""
+pr_url=""
+transcript_path=""
+# Worth recording because §3's flag behavior is undocumented surface: a run that
+# breaks after an upgrade is only diagnosable against the version it ran on
+# (docs/DESIGN.md §7, "contract drift"). Captured at the first write rather than
+# here, because PRINT_PROMPT_ONLY promises a dry run spawns nothing and
+# `claude --version` is a spawn.
+claude_version=""
+
+# Rewrites the record whole, atomically — a reader never sees a half-written
+# file, and a crash leaves the previous stage's record intact. A failure to write
+# it is loud but not fatal: losing the record is bad, killing a run that has
+# already done real work is worse.
+audit_write() {
+  local tmp="$audit_file.partial"
+  mkdir -p "$audit_dir"
+  if jq -n \
+    --argjson issue "$issue" \
+    --arg worktree_path "$worktree_path" \
+    --arg branch "$branch" \
+    --arg session_started_at "$session_started_at" \
+    --arg session_ended_at "$session_ended_at" \
+    --arg exit_reason "$exit_reason" \
+    --arg test_command "$test_command" \
+    --arg test_exit_code "$test_exit_code" \
+    --arg confirm_decision "$confirm_decision" \
+    --arg pr_url "$pr_url" \
+    --arg transcript_path "$transcript_path" \
+    --arg claude_version "$claude_version" \
+    '
+    def blank_is_null: if . == "" then null else . end;
+    def blank_is_null_number: if . == "" then null else tonumber end;
+    {
+      issue: $issue,
+      worktree_path: ($worktree_path | blank_is_null),
+      branch: ($branch | blank_is_null),
+      session_started_at: ($session_started_at | blank_is_null),
+      session_ended_at: ($session_ended_at | blank_is_null),
+      exit_reason: ($exit_reason | blank_is_null),
+      test_command: ($test_command | blank_is_null),
+      test_exit_code: ($test_exit_code | blank_is_null_number),
+      confirm_decision: ($confirm_decision | blank_is_null),
+      pr_url: ($pr_url | blank_is_null),
+      transcript_path: ($transcript_path | blank_is_null),
+      claude_version: ($claude_version | blank_is_null)
+    }' > "$tmp" 2>/dev/null; then
+    mv "$tmp" "$audit_file"
+  else
+    rm -f "$tmp"
+    note "audit: could not write $audit_file — the run continues, the record does not"
+  fi
+}
 
 # --- default branch, as the remote reports it --------------------------------
 # Local origin/HEAD is only set by clone; a repo whose remote was added later has
@@ -303,6 +451,13 @@ git -C "$repo" worktree add --quiet -b "$branch" "$worktree_path" "origin/$defau
 printf 'worktree: %s\n' "$worktree_path"
 printf 'branch:   %s (off origin/%s)\n' "$branch" "$default_branch"
 
+# Stage 1 of the record: the worktree exists. Written before the session is
+# spawned, so a run that dies on the next line still leaves a file naming what it
+# made.
+claude_version="$("$claude_bin" --version 2>/dev/null | head -1 || true)"
+audit_write
+printf 'audit:    %s\n' "$audit_file"
+
 # --- the session's permission model: the repo's own settings, lifted out -----
 # A worktree is a brand-new directory every run, so claude treats it as an
 # untrusted workspace and drops the repo's permissions.allow list entirely
@@ -406,6 +561,8 @@ printf 'ceiling:  %ss wall clock, %s turns\n' "$WALL_CLOCK_CEILING_SECONDS" "$MA
 # stderr when it is not a TTY — which is every scripted or app-driven run
 # (issue #18). The redirect is on this subshell only, so the script itself stays
 # usable interactively.
+session_started_at="$(now)"
+started="$SECONDS"
 set -m
 (
   cd "$worktree_path"
@@ -414,24 +571,15 @@ set -m
 child_pid=$!
 set +m
 
-started="$SECONDS"
 outcome=""
-while kill -0 "$child_pid" 2>/dev/null; do
-  if (( SECONDS - started >= WALL_CLOCK_CEILING_SECONDS )); then
-    outcome="ceiling_wall_clock"
-    note "wall-clock ceiling reached after $((SECONDS - started))s — killing process group $child_pid"
-    kill -TERM -"$child_pid" 2>/dev/null || true
-    grace_until=$(( SECONDS + KILL_GRACE_SECONDS ))
-    while kill -0 "$child_pid" 2>/dev/null && (( SECONDS < grace_until )); do sleep 1; done
-    kill -KILL -"$child_pid" 2>/dev/null || true
-    break
-  fi
-  sleep 1
-done
+if ! wait_with_ceiling "$child_pid" "$WALL_CLOCK_CEILING_SECONDS" "session"; then
+  outcome="ceiling_wall_clock"
+fi
 
 exit_code=0
 wait "$child_pid" 2>/dev/null || exit_code=$?
 elapsed=$(( SECONDS - started ))
+session_ended_at="$(now)"
 
 # --- exit reason: from what this script observed, never from session output ---
 # docs/DESIGN.md §3. The only inputs are our own timer, claude's exit code, and
@@ -484,4 +632,179 @@ if [[ -s "$run_err" ]]; then
   printf 'stderr:      %s\n' "$run_err"
 fi
 
-[[ "$outcome" == "completed" ]] || exit 1
+# Stage 2 of the record: the session is over, and this is what the script saw of
+# it. The transcript path is *found*, not derived — claude's rule for turning a
+# cwd into a directory name under ~/.claude/projects is undocumented, so the only
+# honest way to record the path is to look for the file the session id names and
+# record it only if it is really there. The session id itself is a
+# machine-readable field of the stream, not session prose (docs/DESIGN.md §3).
+
+exit_reason="$outcome"
+session_id="$(jq -r -R 'fromjson? | .session_id // empty' "$run_log" 2>/dev/null | tail -1 || true)"
+if [[ -n "$session_id" ]]; then
+  transcript_path="$(find "$HOME/.claude/projects" -maxdepth 2 -name "$session_id.jsonl" -print -quit 2>/dev/null || true)"
+fi
+audit_write
+
+if [[ "$outcome" != "completed" ]]; then
+  note "session outcome is $outcome — no test run, nothing pushed"
+  exit 1
+fi
+
+# --- the target repo's test command ------------------------------------------
+# docs/DESIGN.md §3, "after exit, in order": tests, then the gate. This runs from
+# this script's own environment rather than the session's allowlist, because it
+# is the harness checking the session's work, not more session work. It is still
+# the untrusted worktree's code being executed — which is why the diff goes in
+# front of a human before anything leaves this machine, not because the test run
+# is trusted.
+
+if [[ -z "$test_command" ]]; then
+  note "tests: TEST_COMMAND is unset — skipping the test run (the header says what to set)"
+else
+  printf 'tests:    %s\n' "$test_command"
+  set -m
+  (
+    cd "$worktree_path"
+    exec bash -c "$test_command"
+  ) > "$test_log" 2>&1 < /dev/null &
+  test_pid=$!
+  set +m
+
+  if wait_with_ceiling "$test_pid" "$TEST_CEILING_SECONDS" "tests"; then
+    test_status=0
+    wait "$test_pid" 2>/dev/null || test_status=$?
+  else
+    wait "$test_pid" 2>/dev/null || true
+    # A killed run has no exit status of its own worth recording — the ceiling is
+    # the finding. 124 is timeout(1)'s convention, borrowed so the number in the
+    # record means something to a reader.
+    test_status=124
+  fi
+  test_exit_code="$test_status"
+  audit_write
+
+  if (( test_status != 0 )); then
+    # docs/DESIGN.md §3: a non-zero test command is one of the two things that
+    # make a run a task_failure, and it is the script's own observation.
+    exit_reason="task_failure"
+    audit_write
+    printf 'tests:    FAILED (exit %s)\n' "$test_status"
+    printf -- '--- last %s lines of %s ---\n' "$TEST_TAIL_LINES" "$test_log"
+    tail -n "$TEST_TAIL_LINES" "$test_log" || true
+    printf -- '--- end of test output ---\n'
+    note "tests failed — recorded task_failure, nothing pushed"
+    exit 1
+  fi
+  printf 'tests:    passed\n'
+fi
+
+# --- what the session actually left on the branch ----------------------------
+# An empty branch is a real outcome of a session that "completed": it answered,
+# committed nothing, and there is no diff to review and no PR worth opening.
+
+commits_ahead="$(git -C "$repo" rev-list --count "origin/$default_branch..$branch")" \
+  || die "$repo" "to be able to count commits on $branch" "git rev-list failed" \
+         "check that origin/$default_branch and $branch both exist in $repo"
+
+if (( commits_ahead == 0 )); then
+  note "the session committed nothing on $branch — nothing to push, no PR to open"
+  exit 1
+fi
+
+if [[ -n "$(git -C "$worktree_path" status --porcelain)" ]]; then
+  note "the worktree has uncommitted changes: they are NOT in the diff below and would NOT be in the PR"
+fi
+
+printf '\ncommits on %s (%s):\n' "$branch" "$commits_ahead"
+git -C "$repo" log --oneline "origin/$default_branch..$branch"
+printf '\n'
+git -C "$repo" diff --stat "origin/$default_branch...$branch"
+printf '\n'
+
+# --- the confirm gate --------------------------------------------------------
+# The answer is read from /dev/tty rather than stdin, so that a pipe, a here-doc
+# or a wrapper script cannot answer on the human's behalf. No terminal means
+# nobody is there, which is a decline, not a default-yes: this gate failing
+# closed is the whole point of it existing (docs/PRD.md §4, §5).
+
+confirm_decision="declined"
+# The open is probed in a subshell first. /dev/tty carries a read bit even where
+# there is no controlling terminal — a scripted or app-driven run, which is every
+# run this script is a stand-in for — and only opening it tells the two apart.
+# The probe subshell absorbs the shell's own "device not configured" message so
+# the note below is the only thing the human sees.
+if ( exec 3<>/dev/tty ) 2>/dev/null; then
+  exec 3<>/dev/tty
+  reply=""
+  printf 'Push %s to origin and open a draft PR into %s? [y/N] ' "$branch" "$default_branch" >&3
+  IFS= read -r reply <&3 || reply=""
+  exec 3>&-
+  case "$reply" in
+    y|Y) confirm_decision="confirmed" ;;
+    *)   confirm_decision="declined" ;;
+  esac
+else
+  note "confirm: no terminal on /dev/tty, so nobody is here to answer — declining"
+fi
+audit_write
+
+if [[ "$confirm_decision" != "confirmed" ]]; then
+  printf 'confirm:  declined — nothing pushed, no PR opened\n'
+  printf 'audit:    %s\n' "$audit_file"
+  exit 0
+fi
+
+# --- push, then the draft PR -------------------------------------------------
+# Tier 3 in docs/PRD.md §4: externally visible, reversible, and now confirmed.
+# Both commands run here, from this script's environment and the user's own gh
+# auth, never from inside the session (CLAUDE.md §12). Neither can move an
+# existing ref: a plain push is not a force push, and a draft PR is not a merge.
+
+git -C "$repo" push -u origin "$branch" \
+  || die "git -C $repo push -u origin $branch" "the branch to reach origin" \
+         "git push exited non-zero" \
+         "check the remote and your gh/git credentials; the worktree and branch are untouched, so pushing by hand is safe"
+
+command -v gh >/dev/null \
+  || die "PATH" "gh on PATH (needed to open the draft PR)" "not found" \
+         "brew install gh — the branch is already pushed, so the PR can be opened by hand"
+
+# The issue title is already in hand unless argument 2 skipped the lookup. Ask
+# for it rather than inventing one; fall back to the branch name only if gh
+# cannot answer, so a PR never carries a title this script made up about content.
+if [[ -z "${issue_title:-}" ]]; then
+  issue_title="$(cd "$repo" && gh issue view "$issue" --json title -q .title 2>/dev/null || true)"
+fi
+[[ -n "$issue_title" ]] || issue_title="$branch"
+
+pr_body="$(printf '%s\n' \
+"Opened by scripts/ticket-to-pr.sh after a headless Claude Code session in an" \
+"isolated worktree (Phase 0 mechanism, docs/ROADMAP.md)." \
+"" \
+"- Session outcome: ${exit_reason}" \
+"- Tests: ${test_command:-none configured}${test_exit_code:+ (exit ${test_exit_code})}" \
+"- Audit record: ${audit_file}" \
+"" \
+"A human read the diff at the confirm gate before this was opened. It is a draft" \
+"on purpose — review it as you would any other pull request." \
+"" \
+"Closes #${issue}")"
+
+# The URL is whatever gh prints back, never a URL assembled from a number this
+# script guessed (CLAUDE.md §2 rule 8). stderr is folded in so a failure message
+# is part of the paste-able error rather than lost.
+pr_output="$(cd "$repo" && gh pr create --draft --base "$default_branch" --head "$branch" --title "$issue_title" --body "$pr_body" 2>&1)" \
+  || die "gh pr create --draft (run in $repo)" "a draft pull request for $branch" \
+         "gh exited non-zero: $pr_output" \
+         "check 'gh auth status'; the branch is pushed, so the PR can be opened by hand"
+
+pr_url="$(printf '%s\n' "$pr_output" | grep -Eo 'https://[^[:space:]]+/pull/[0-9]+' | tail -1 || true)"
+[[ -n "$pr_url" ]] \
+  || die "gh pr create --draft" "a pull request URL in gh's output" \
+         "no URL found in: $pr_output" \
+         "check the pull request list for $branch — one may exist despite the missing URL"
+audit_write
+
+printf 'PR:       %s (draft)\n' "$pr_url"
+printf 'audit:    %s\n' "$audit_file"
