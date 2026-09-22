@@ -23,7 +23,9 @@
       "Bash(swift build:*)",
       "Bash(swift format lint:*)",
       "Bash(swift test:*)",
-      "Bash(bash -n:*)"
+      "Bash(bash -n:*)",
+      "Edit(**)",
+      "Write(**)"
     ],
     "deny": [
       "Bash(git push --force:*)",
