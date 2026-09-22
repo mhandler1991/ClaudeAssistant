@@ -13,11 +13,11 @@
 # Environment:
 #   WORKTREE_PARENT  (optional)  Directory that holds ticket-<n> worktrees.
 #                                Default: the path in docs/DESIGN.md §2.
-#   ALLOWED_TOOLS    (optional)  Passed through as --allowedTools. Used by the
-#                                Phase 0 probe runs that verify the environment
-#                                allowlist and the ceiling; a production run sets
-#                                nothing and inherits the target repo's own
-#                                permission settings.
+#   ALLOWED_TOOLS    (optional)  Passed through as --allowedTools. A probe-run
+#                                escape hatch only — a production run sets
+#                                nothing and gets the target repo's own
+#                                permission settings instead (see "permission
+#                                model" below).
 #   WALL_CLOCK_CEILING_SECONDS, MAX_TURNS  (optional)
 #                                Override the ceilings below. They exist so a
 #                                probe run can trip a ceiling in under a minute;
@@ -31,6 +31,11 @@
 # session cannot edit its own record. Nothing here pushes, merges, or touches the
 # default branch. The session's cwd is always the ticket worktree, never this
 # checkout (CLAUDE.md §12).
+#
+# Permission model: the session runs under the target repo's own committed
+# .claude/settings.json, lifted to "runs/ticket-<n>.settings.json" and passed
+# back with --settings. A fresh worktree is never a trusted workspace, so that
+# file would otherwise be ignored outright (issue #15, docs/DESIGN.md §3).
 #
 # Re-running for the same issue is refused while its worktree or branch exists;
 # once those are cleaned up, a new run truncates the previous run log. Durable
@@ -55,6 +60,10 @@ readonly KEYCHAIN_SERVICE="ClaudeAssistant"
 readonly KEYCHAIN_ACCOUNT="anthropic"
 # The one permission mode this script will never pass (docs/PRD.md §3 principle 3).
 readonly FORBIDDEN_PERMISSION_MODE="bypassPermissions"
+# Which of claude's own settings sources the session may load. The repo's project
+# settings arrive via --settings instead, so listing "project" here would only
+# re-read them from the untrusted worktree and warn (docs/DESIGN.md §3).
+readonly SETTING_SOURCES="user"
 
 # Every error is shaped to be pasted straight back into a Claude session:
 # where it happened, what was expected, what was actually found, and a fix.
@@ -112,6 +121,7 @@ worktree_path="$worktree_parent/$branch"
 runs_dir="$(dirname "$worktree_parent")/runs"
 run_log="$runs_dir/$branch.jsonl"
 run_err="$runs_dir/$branch.stderr"
+run_settings="$runs_dir/$branch.settings.json"
 
 # --- default branch, as the remote reports it --------------------------------
 # Local origin/HEAD is only set by clone; a repo whose remote was added later has
@@ -157,14 +167,42 @@ git -C "$repo" worktree add --quiet -b "$branch" "$worktree_path" "origin/$defau
 printf 'worktree: %s\n' "$worktree_path"
 printf 'branch:   %s (off origin/%s)\n' "$branch" "$default_branch"
 
-# --- permission mode, from the target repo's own settings --------------------
-# Never invented here, and bypassPermissions is refused rather than silently
-# dropped, so a repo that asks for it gets an answer instead of a surprise.
+# --- the session's permission model: the repo's own settings, lifted out -----
+# A worktree is a brand-new directory every run, so claude treats it as an
+# untrusted workspace and drops the repo's permissions.allow list entirely
+# (issue #15). Handing the same file back with --settings restores it, because a
+# settings file named on the command line comes from the invoker rather than
+# from the workspace. SETTING_SOURCES then stops claude reading the in-worktree
+# copy a second time — that second read is what emits the "Ignoring N
+# permissions.allow entries" warning (docs/DESIGN.md §3).
+#
+# The copy is lifted to the runs directory, outside the worktree, for the same
+# reason the run log is: the session must not be able to rewrite the file that
+# decides what it is allowed to do while it is running. The file inspected below
+# is therefore the exact file the session is spawned with.
+#
+# This widens nothing. The lifted file is a byte-for-byte copy of the repo's own
+# committed settings, deny entries included.
 
-permission_mode=""
+mkdir -p "$runs_dir"
 target_settings="$worktree_path/.claude/settings.json"
 if [[ -f "$target_settings" ]]; then
-  permission_mode="$(jq -r '.permissions.defaultMode // empty' "$target_settings" 2>/dev/null || true)"
+  cp "$target_settings" "$run_settings"
+  note "permissions: the repo's own .claude/settings.json, via $run_settings"
+else
+  # Stale copy from an earlier run for this issue would otherwise be passed for a
+  # repo state that no longer has one.
+  rm -f "$run_settings"
+  run_settings=""
+  note "permissions: the repo has no .claude/settings.json — user settings only"
+fi
+
+# bypassPermissions is refused rather than silently dropped, so a repo that asks
+# for it gets an answer instead of a surprise. Read from the lifted copy, since
+# that is what the session actually gets.
+permission_mode=""
+if [[ -n "$run_settings" ]]; then
+  permission_mode="$(jq -r '.permissions.defaultMode // empty' "$run_settings" 2>/dev/null || true)"
 fi
 if [[ "$permission_mode" == "$FORBIDDEN_PERMISSION_MODE" ]]; then
   die "$target_settings" \
@@ -209,11 +247,14 @@ claude_args=(
 if [[ -n "$permission_mode" ]]; then
   claude_args+=(--permission-mode "$permission_mode")
 fi
+if [[ -n "$run_settings" ]]; then
+  claude_args+=(--settings "$run_settings")
+fi
+claude_args+=(--setting-sources "$SETTING_SOURCES")
 if [[ -n "${ALLOWED_TOOLS:-}" ]]; then
   claude_args+=(--allowedTools "$ALLOWED_TOOLS")
 fi
 
-mkdir -p "$runs_dir"
 : > "$run_log"
 : > "$run_err"
 
@@ -223,11 +264,17 @@ printf 'ceiling:  %ss wall clock, %s turns\n' "$WALL_CLOCK_CEILING_SECONDS" "$MA
 # Job control gives the child its own process group, with pgid == pid. The
 # ceiling kills the group, not the pid, so a test runner the session spawned
 # dies with it (docs/DESIGN.md §7, "runaway session survives the ceiling").
+#
+# stdin is /dev/null, not inherited: the prompt arrives via -p and the session
+# has no stdin to read, but claude waits 3s for inherited stdin and warns on
+# stderr when it is not a TTY — which is every scripted or app-driven run
+# (issue #18). The redirect is on this subshell only, so the script itself stays
+# usable interactively.
 set -m
 (
   cd "$worktree_path"
   exec env -i "${child_env[@]}" "$claude_bin" "${claude_args[@]}"
-) > "$run_log" 2> "$run_err" &
+) > "$run_log" 2> "$run_err" < /dev/null &
 child_pid=$!
 set +m
 
