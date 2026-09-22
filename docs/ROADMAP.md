@@ -109,12 +109,13 @@ command, puts the commits and the diff in front of a human at a confirm gate tha
 closed, and — only on a `y` — pushes the branch and opens the draft PR. Every run leaves
 one JSON audit record outside the worktree.
 
-What the phase still owes is issue #23 and the three real runs themselves. **#23 blocks
-them:** the repo's own `.claude/settings.json` grants 23 `Bash(...)` permissions and no
-`Write` or `Edit`, so a headless session in a fresh worktree cannot change a file — a
-real run on 2026-09-22 was denied its one `Write` and committed nothing. Until that is
-decided, no run can produce a diff, and a run that produces no diff cannot produce a
-mergeable PR. The query below is the current list, so it can't go stale here.
+Issue #23 — a headless session denied every file change, because all 23 of the repo's
+`allow` entries were `Bash(...)` — is **decided and fixed in the repo's own settings**
+(`DESIGN.md` §3): the entries are `Edit(**)` and `Write(**)`, committed to
+`.claude/settings.json` rather than added by the script at spawn, and scoped by that glob
+to the session's worktree so the audit log and the lifted settings file stay out of
+reach. What the phase still owes is **the three real runs themselves**, which are now
+unblocked. The query below is the current list, so it can't go stale here.
 
 The **done-when bar above is unchanged and still unmet**. None of the above clears it:
 the script has never been driven end to end through a PR.

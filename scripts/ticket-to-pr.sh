@@ -15,6 +15,19 @@
 # Environment:
 #   WORKTREE_PARENT  (optional)  Directory that holds ticket-<n> worktrees.
 #                                Default: the path in docs/DESIGN.md §2.
+#   BASE_REF         (optional)  The ref the worktree is cut from. Default, and
+#                                what a production run gets by setting nothing:
+#                                "origin/<default branch>". A probe escape hatch.
+#                                Anything that changes what the session is handed
+#                                — the repo's own .claude/settings.json, the
+#                                prompt framing, CLAUDE.md — otherwise cannot be
+#                                exercised until it has already merged, because
+#                                the worktree is cut from the branch that change
+#                                is still waiting to reach (issue #27, found
+#                                while verifying #23). It moves the worktree base
+#                                only: the pull request is still opened into the
+#                                default branch, so a confirmed probe run cannot
+#                                target anything but integration.
 #   ALLOWED_TOOLS    (optional)  Passed through as --allowedTools. A probe-run
 #                                escape hatch only — a production run sets
 #                                nothing and gets the target repo's own
@@ -80,7 +93,11 @@
 # Permission model: the session runs under the target repo's own committed
 # .claude/settings.json, lifted to "runs/ticket-<n>.settings.json" and passed
 # back with --settings. A fresh worktree is never a trusted workspace, so that
-# file would otherwise be ignored outright (issue #15, docs/DESIGN.md §3).
+# file would otherwise be ignored outright (issue #15, docs/DESIGN.md §3). The
+# copy is verbatim and this script adds nothing to it: a session that may not
+# edit files is a repo that did not grant Write or Edit, and the fix belongs in
+# the repo's settings, not here (issue #23). The preflight below says so out loud
+# rather than letting the run discover it by producing no diff.
 #
 # The confirm gate: nothing reaches GitHub without an interactive "y" read from
 # /dev/tty rather than from stdin, so a piped answer cannot satisfy it and a run
@@ -135,6 +152,11 @@ readonly KEYCHAIN_SERVICE="ClaudeAssistant"
 readonly KEYCHAIN_ACCOUNT="anthropic"
 # The one permission mode this script will never pass (docs/PRD.md §3 principle 3).
 readonly FORBIDDEN_PERMISSION_MODE="bypassPermissions"
+# The tools that let a session change a file, as an alternation for jq's test().
+# A repo granting none of them gets a session that can read and run things but
+# cannot produce a diff — the silent failure issue #23 was filed for. This script
+# only reports that; it never adds the rule itself (docs/DESIGN.md §3).
+readonly FILE_EDITING_TOOLS="Write|Edit|MultiEdit|NotebookEdit"
 # Which of claude's own settings sources the session may load. The repo's project
 # settings arrive via --settings instead, so listing "project" here would only
 # re-read them from the untrusted worktree and warn (docs/DESIGN.md §3).
@@ -354,6 +376,7 @@ audit_write() {
     --argjson issue "$issue" \
     --arg worktree_path "$worktree_path" \
     --arg branch "$branch" \
+    --arg base_ref "$base_ref" \
     --arg session_started_at "$session_started_at" \
     --arg session_ended_at "$session_ended_at" \
     --arg exit_reason "$exit_reason" \
@@ -373,6 +396,7 @@ audit_write() {
       issue: $issue,
       worktree_path: ($worktree_path | blank_is_null),
       branch: ($branch | blank_is_null),
+      base_ref: ($base_ref | blank_is_null),
       session_started_at: ($session_started_at | blank_is_null),
       session_ended_at: ($session_ended_at | blank_is_null),
       exit_reason: ($exit_reason | blank_is_null),
@@ -415,6 +439,26 @@ fi
 # conventions file only if that file actually exists on the branch the worktree
 # will be cut from. Creating anything is still further down.
 git -C "$repo" fetch origin "$default_branch" --quiet
+
+# --- the ref the worktree is cut from ----------------------------------------
+# Integration, normally: a ticket is implemented against the branch it will merge
+# into, not against whatever happens to be checked out here. BASE_REF overrides
+# that so a change to what the session itself is handed — the repo's own
+# settings, the prompt framing, CLAUDE.md — can be exercised before it has
+# merged, instead of only after (issue #27). It moves this one ref and nothing
+# else: the pull request further down is still opened into $default_branch, so a
+# probe run that reaches the confirm gate and is answered "y" still cannot target
+# anything but integration.
+
+base_ref="origin/$default_branch"
+if [[ -n "${BASE_REF:-}" ]]; then
+  base_ref="$BASE_REF"
+  note "base: the worktree is cut from $base_ref, not origin/$default_branch (probe escape hatch)"
+fi
+git -C "$repo" rev-parse --verify --quiet "$base_ref^{commit}" >/dev/null \
+  || die "$repo" "a ref this repo can resolve: $base_ref" \
+         "git could not resolve it to a commit" \
+         "fetch it first, or unset BASE_REF to cut from origin/$default_branch"
 
 # --- the prompt: framing, then the issue as a delimited data block ------------
 # docs/DESIGN.md §2 "Issue text is data". Both delimiters carry the issue number,
@@ -483,7 +527,7 @@ if [[ -z "$prompt" ]]; then
 
   # Named, never inlined: the conventions file is large, it changes, and a stale
   # copy pasted into a prompt is worse than a path (docs/PRD.md §4, "Session").
-  if git -C "$repo" cat-file -e "origin/$default_branch:CLAUDE.md" 2>/dev/null; then
+  if git -C "$repo" cat-file -e "$base_ref:CLAUDE.md" 2>/dev/null; then
     conventions="Read ./CLAUDE.md at the root of this worktree before you change anything, and follow it. It is this project's standards document — read the file rather than working from memory of it, and do not ask for it to be pasted."
   else
     conventions="This worktree has no CLAUDE.md at its root. Follow the conventions already visible in the files you are changing."
@@ -495,7 +539,7 @@ if [[ -z "$prompt" ]]; then
   prompt="$(printf '%s\n' \
 "You are a headless Claude Code session. Your working directory is a fresh git" \
 "worktree of the ${repo_name} repository, on branch ${branch}, cut from" \
-"origin/${default_branch}. Implement the GitHub issue reproduced in the data" \
+"${base_ref}. Implement the GitHub issue reproduced in the data" \
 "block below." \
 "" \
 "${conventions}" \
@@ -554,10 +598,10 @@ done < <(git -C "$repo" worktree list --porcelain)
 # --- create ------------------------------------------------------------------
 
 mkdir -p "$worktree_parent"
-git -C "$repo" worktree add --quiet -b "$branch" "$worktree_path" "origin/$default_branch"
+git -C "$repo" worktree add --quiet -b "$branch" "$worktree_path" "$base_ref"
 
 printf 'worktree: %s\n' "$worktree_path"
-printf 'branch:   %s (off origin/%s)\n' "$branch" "$default_branch"
+printf 'branch:   %s (off %s)\n' "$branch" "$base_ref"
 
 # Stage 1 of the record: the worktree exists. Written before the session is
 # spawned, so a run that dies on the next line still leaves a file naming what it
@@ -608,6 +652,23 @@ if [[ "$permission_mode" == "$FORBIDDEN_PERMISSION_MODE" ]]; then
       "any permission mode but $FORBIDDEN_PERMISSION_MODE" \
       "permissions.defaultMode is $FORBIDDEN_PERMISSION_MODE" \
       "this script never passes it (docs/PRD.md §3 principle 3); change the repo's setting"
+fi
+
+# A session that may not edit files still runs to completion, still costs a
+# session, and still produces nothing — the failure in issue #23, whose only
+# evidence at the time was one entry in the result line's permission_denials.
+# Naming it before the spawn costs a jq call. It stays a note rather than a
+# refusal: a repo may legitimately want a read-only session, and this script does
+# not get to decide the repo's permission model — only to report what it is.
+# acceptEdits counts as a grant, since it allows the file tools with no entry.
+if [[ -n "$run_settings" ]]; then
+  grants_edits="$(jq -r --arg tools "$FILE_EDITING_TOOLS" '
+    (((.permissions.allow // []) | map(select(test("^(" + $tools + ")\\b"))) | length) > 0)
+    or ((.permissions.defaultMode // "") == "acceptEdits")
+  ' "$run_settings" 2>/dev/null || echo "true")"
+  if [[ "$grants_edits" == "false" ]]; then
+    note "permissions: $target_settings grants no $FILE_EDITING_TOOLS rule and does not default to acceptEdits — every file change this session attempts will be denied, and a run that changes nothing yields no diff and no PR (issue #23)"
+  fi
 fi
 
 # --- the child environment: an allowlist, built here and nowhere else ---------
@@ -850,9 +911,13 @@ fi
 # An empty branch is a real outcome of a session that "completed": it answered,
 # committed nothing, and there is no diff to review and no PR worth opening.
 
-commits_ahead="$(git -C "$repo" rev-list --count "origin/$default_branch..$branch")" \
+# Counted against the base the worktree was actually cut from, not against the
+# default branch: with BASE_REF set the two differ, and measuring against the
+# default branch would show the human a diff that is not the one this session
+# produced (issue #27).
+commits_ahead="$(git -C "$repo" rev-list --count "$base_ref..$branch")" \
   || die "$repo" "to be able to count commits on $branch" "git rev-list failed" \
-         "check that origin/$default_branch and $branch both exist in $repo"
+         "check that $base_ref and $branch both exist in $repo"
 
 if (( commits_ahead == 0 )); then
   note "the session committed nothing on $branch — nothing to push, no PR to open"
@@ -864,9 +929,9 @@ if [[ -n "$(git -C "$worktree_path" status --porcelain)" ]]; then
 fi
 
 printf '\ncommits on %s (%s):\n' "$branch" "$commits_ahead"
-git -C "$repo" log --oneline "origin/$default_branch..$branch"
+git -C "$repo" log --oneline "$base_ref..$branch"
 printf '\n'
-git -C "$repo" diff --stat "origin/$default_branch...$branch"
+git -C "$repo" diff --stat "$base_ref...$branch"
 printf '\n'
 
 # --- the confirm gate --------------------------------------------------------
