@@ -102,6 +102,23 @@ Audit-record fields are the product-level list in `PRD.md` §4; the encoding is 
 yet — persistence and cross-run reads are 🔮 Phase 5's trigger, and this file gets a
 `DATA-MODEL.md` sibling the day that fires.
 
+**Phase 0 already writes this shape from the script** (issue #5), carrying the subset of
+fields a script can observe: issue number, worktree path, branch, session start and end,
+exit reason, test command and exit code, confirm decision, PR URL, transcript path, and
+`claude --version`. Three properties of it are worth carrying into `Audit/` rather than
+rediscovering, each verified on a real run:
+
+- **Rewritten whole at every stage** — worktree created, session exited, tests done, gate
+  answered, PR opened — so a crash leaves the previous stage's record rather than none.
+  Written to a temporary file and moved into place, so a reader never sees a half-written
+  object.
+- **A value not yet known is `null`, never an absent key.** A reader has to be able to
+  tell "the run never got this far" from "the field is gone".
+- **The transcript path is found, not derived.** `claude`'s rule for turning a cwd into a
+  directory name under `~/.claude/projects` is undocumented, so the script takes the
+  session id from the stream — a machine-readable field, not prose — searches for the
+  file it names, and records the path only if the file is really there.
+
 ### Issue text is data
 
 The prompt assembled in `Session/` has the shape — built and verified by Phase 0's
@@ -267,6 +284,9 @@ session's `chmod` was refused and the target file's mode was unchanged.
   own timer, not by `timeout` — macOS has no `timeout(1)`.
 - Turns: `--max-turns`, enforced by `claude` itself; the app also watches for the
   `error_max_turns` result subtype so it's surfaced distinctly
+- The target repo's test command gets its own ceiling and the same process-group kill: a
+  hung test runner and a runaway session are different failures, and Phase 1 surfaces
+  them separately
 
 **Process-group kill, verified.** Phase 0 ran a session that launched a 600-second child
 process against a 45-second ceiling. `SIGTERM` to the *negated* pid (`kill -TERM -$pid`,
@@ -332,6 +352,17 @@ pass: transition to *PR ready* (confirm gate) · fail: *Error*, `task_failure`, 
 Then, on confirm only: `git push -u origin {branch}` → `gh pr create --draft` → record
 the PR URL `gh` returned. Both run from the app, with the app's environment, never from
 the session.
+
+**The confirm gate fails closed** (Phase 0, issue #4). The script reads the answer from
+`/dev/tty` rather than stdin, so a pipe, a here-doc or a wrapper script cannot answer on
+the human's behalf, and no terminal to open is a *decline*, not a default-yes. The
+presence of the device is not the test — `/dev/tty` carries a read bit even where there
+is no controlling terminal, which is every scripted or app-driven run — so the script
+probes it by opening it. Two things have to hold before the gate is offered at all: the
+tests passed or none were configured, and the branch carries at least one commit. A
+session that finishes cleanly having committed nothing stops short of the gate, because
+there is no diff to review and no pull request worth opening. Both were observed on real
+runs.
 
 **Hooks and transcript tail (🔮 Phase 2):** the app registers `PreToolUse` /
 `PostToolUse` hooks pointing at a small executable it ships, which appends to a named

@@ -100,14 +100,21 @@ phase here.
 
 ## Current status
 
-**Active: Phase 0.** `scripts/ticket-to-pr.sh` exists and runs. It creates the
-worktree and branch, assembles the prompt from the issue as a delimited data block,
-spawns the headless session with an allowlist environment and the target repo's own
-permission settings, enforces both ceilings, and derives the run's outcome from what
-it observed rather than from what the session reported. What the phase still owes is
-the post-session test run and the confirm-gated draft PR, the per-run audit record,
-and the three real runs themselves — the query below is the current list, so it can't
-go stale here.
+**Active: Phase 0.** `scripts/ticket-to-pr.sh` exists and runs the whole loop. It
+creates the worktree and branch, assembles the prompt from the issue as a delimited data
+block, spawns the headless session with an allowlist environment and the target repo's
+own permission settings, enforces the ceilings, derives the run's outcome from what it
+observed rather than from what the session reported, runs the target repo's test
+command, puts the commits and the diff in front of a human at a confirm gate that fails
+closed, and — only on a `y` — pushes the branch and opens the draft PR. Every run leaves
+one JSON audit record outside the worktree.
+
+What the phase still owes is issue #23 and the three real runs themselves. **#23 blocks
+them:** the repo's own `.claude/settings.json` grants 23 `Bash(...)` permissions and no
+`Write` or `Edit`, so a headless session in a fresh worktree cannot change a file — a
+real run on 2026-09-22 was denied its one `Write` and committed nothing. Until that is
+decided, no run can produce a diff, and a run that produces no diff cannot produce a
+mergeable PR. The query below is the current list, so it can't go stale here.
 
 The **done-when bar above is unchanged and still unmet**. None of the above clears it:
 the script has never been driven end to end through a PR.
